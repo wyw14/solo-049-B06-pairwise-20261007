@@ -38,19 +38,28 @@ func (f *Finalizer) Finalize(ctx context.Context, passID, chainID string) (Final
 		return FinalizeResult{}, fmt.Errorf("pass %s has no recording segment", passID)
 	}
 	if err := f.passes.update(passID, func(current *Pass) error {
+		if current.Phase != Tracking && current.Phase != Draining {
+			return fmt.Errorf("pass cannot finalize from phase %s", current.Phase)
+		}
 		current.Phase = Draining
 		return nil
 	}); err != nil {
 		return FinalizeResult{}, err
 	}
+	// Unlock is the safety boundary: the recording may only be drained and
+	// sealed, and the pass completed, after the receiver chain is released.
+	// A failure (including timeout) stops here with the pass still Draining
+	// so finalization can be retried once the chain is free.
 	unlockContext, cancelUnlock := context.WithTimeout(ctx, f.unlockTimeout)
 	unlockErr := f.unlocker.Unlock(unlockContext, chainID, passID)
 	cancelUnlock()
+	if unlockErr != nil {
+		result := FinalizeResult{PassID: passID, UnlockError: unlockErr.Error()}
+		_, _ = f.audit.Record(audit.Event{Component: "pass", Action: "finalize.blocked", Subject: passID, Severity: audit.Warning, Fields: map[string]any{"chain_id": chainID, "unlock_error": result.UnlockError}})
+		return result, fmt.Errorf("receiver chain %s did not unlock, pass remains %s: %w", chainID, Draining, unlockErr)
+	}
 
 	result := FinalizeResult{PassID: passID}
-	if unlockErr != nil {
-		result.UnlockError = unlockErr.Error()
-	}
 	drained, drainErr := f.recorder.Drain(ctx, value.RecordingSegmentID)
 	result.FramesDrained = drained
 	if drainErr != nil {
@@ -67,6 +76,6 @@ func (f *Finalizer) Finalize(ctx context.Context, passID, chainID string) (Final
 	}); err != nil {
 		return result, err
 	}
-	_, _ = f.audit.Record(audit.Event{Component: "pass", Action: "finalized", Subject: passID, Fields: map[string]any{"frames_drained": drained, "unlock_error": result.UnlockError}})
+	_, _ = f.audit.Record(audit.Event{Component: "pass", Action: "finalized", Subject: passID, Fields: map[string]any{"frames_drained": drained}})
 	return result, nil
 }
