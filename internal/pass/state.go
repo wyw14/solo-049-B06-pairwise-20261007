@@ -174,6 +174,61 @@ func (s *Service) Fail(passID, reason string) error {
 	})
 }
 
+// BeginFinalize pins an actively tracking pass (or one already Draining from a
+// retried finalize) into Draining. It is the only legal entry point into
+// finalization: completed, sealed, failed, canceled and pre-tracking passes
+// cannot enter it.
+func (s *Service) BeginFinalize(passID string) error {
+	return s.update(passID, func(value *Pass) error {
+		switch value.Phase {
+		case Tracking, Draining:
+			value.Phase = Draining
+			value.FailureReason = ""
+			return nil
+		default:
+			return fmt.Errorf("pass cannot finalize from phase %s", value.Phase)
+		}
+	})
+}
+
+// CompleteFinalize marks a pass Completed only once its recording segment has
+// been durably sealed, so a task can never report complete while its data is
+// still open or buffered.
+func (s *Service) CompleteFinalize(passID, segmentID string) error {
+	segment, found := s.recorder.Segment(segmentID)
+	if !found {
+		return fmt.Errorf("recording segment %s not found", segmentID)
+	}
+	if segment.Status != recorder.Sealed {
+		return fmt.Errorf("recording segment %s is %s, not sealed", segmentID, segment.Status)
+	}
+	return s.update(passID, func(value *Pass) error {
+		if value.Phase != Draining {
+			return fmt.Errorf("pass cannot complete from phase %s", value.Phase)
+		}
+		if value.RecordingSegmentID != segmentID {
+			return fmt.Errorf("recording segment does not match pass %s", passID)
+		}
+		value.Phase = Completed
+		value.FailureReason = ""
+		return nil
+	})
+}
+
+// FailFinalize records a finalization failure while the pass is Draining. The
+// phase stays recoverable: the receiver may still be locked and the recording
+// may still be open/draining, so an operator can retry finalize rather than
+// finding a falsely Completed task.
+func (s *Service) FailFinalize(passID, reason string) error {
+	return s.update(passID, func(value *Pass) error {
+		if value.Phase != Draining {
+			return fmt.Errorf("pass cannot record finalize failure from phase %s", value.Phase)
+		}
+		value.FailureReason = reason
+		return nil
+	})
+}
+
 func (s *Service) Cancel(passID, reason string) error {
 	return s.update(passID, func(value *Pass) error {
 		if value.Phase == Completed || value.Phase == Sealed {

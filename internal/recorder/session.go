@@ -18,6 +18,7 @@ type session struct {
 
 type Manager struct {
 	mu       sync.RWMutex
+	drainMu  sync.Mutex
 	path     string
 	sessions map[string]*session
 	writer   *FrameWriter
@@ -94,6 +95,16 @@ func (m *Manager) ActiveForPass(passID string) (Segment, bool) {
 		}
 	}
 	return Segment{}, false
+}
+
+func (m *Manager) Segment(segmentID string) (Segment, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	current, found := m.sessions[segmentID]
+	if !found {
+		return Segment{}, false
+	}
+	return current.segment, true
 }
 
 func (m *Manager) List() []Segment {
